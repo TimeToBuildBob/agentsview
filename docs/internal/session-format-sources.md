@@ -4114,6 +4114,12 @@ schemas keep their existing ordering behavior.
 - **Usage and cost:** Assistant metadata can persist input, output, cache-read,
   and cache-creation tokens with model data. Agentsview catalog-prices the
   normalized usage and consumes no authoritative persisted USD total.
+  Reverified 2026-10-19 at the pinned commit: provider routing appends `@host`
+  to model IDs; the
+  [OpenAI adapter](https://github.com/gptme/gptme/blob/a1d8ca21dd662e04970ff36c8c3e9b342f989605/gptme/llm/llm_openai.py#L1107-L1111)
+  extracts that suffix separately from the API model. Agentsview strips it
+  before pricing. Parser data version 140 reparses unchanged gptme sources
+  in place without changing source or session identities.
 - **Agentsview:** `internal/parser/gptme.go` and
   `internal/parser/gptme_provider.go`.
 
