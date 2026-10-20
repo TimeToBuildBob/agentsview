@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // parseSession parses a gptme conversation.jsonl file. gptme stores one
@@ -16,21 +17,26 @@ import (
 // carry an optional metadata object with model and usage sub-fields.
 func (p *gptmeProvider) parseSession(
 	path, machine string,
-) (*ParsedSession, []ParsedMessage, error) {
+) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("stat %s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("stat %s: %w", path, err)
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open %s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	defer f.Close()
 
 	lr := newLineReader(f, maxLineSize)
 	defer releaseLineReader(lr)
+
+	sessionName := filepath.Base(filepath.Dir(path))
+	sessionID := "gptme:" + sessionName
+
 	var (
 		messages     []ParsedMessage
+		events       []ParsedUsageEvent
 		startedAt    time.Time
 		endedAt      time.Time
 		ordinal      int
@@ -103,7 +109,14 @@ func (p *gptmeProvider) parseSession(
 				ContentLength:      len(content),
 				tokenPresenceKnown: true,
 			}
-			applyGptmeTokenUsage(&pm, line)
+			if ev, ok := gptmeExactCostEvent(line, sessionID, ordinal, currentModel, ts, startedAt); ok {
+				// Provider-reported cost: tokens move to the usage event so the
+				// DB does not double-count them from both the message row and
+				// the event row. The message row intentionally carries no tokens.
+				events = append(events, ev)
+			} else {
+				applyGptmeTokenUsage(&pm, line)
+			}
 			messages = append(messages, pm)
 			ordinal++
 
@@ -130,15 +143,12 @@ func (p *gptmeProvider) parseSession(
 	}
 
 	if err := lr.Err(); err != nil {
-		return nil, nil, fmt.Errorf("reading gptme %s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("reading gptme %s: %w", path, err)
 	}
 
 	if len(messages) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
-
-	sessionName := filepath.Base(filepath.Dir(path))
-	sessionID := "gptme:" + sessionName
 
 	project := gptmeProjectFromSessionName(sessionName)
 	if project == "" {
@@ -163,8 +173,70 @@ func (p *gptmeProvider) parseSession(
 	}
 
 	accumulateMessageTokenUsage(sess, messages)
+	// Additively merge provider-cost event token totals that were not counted
+	// on the per-message rows (to avoid DB double-counting, those messages carry
+	// no TokenUsage; we recover the totals here so ParsedSession stays accurate).
+	for _, ev := range events {
+		if ev.OutputTokens > 0 {
+			sess.HasTotalOutputTokens = true
+			sess.TotalOutputTokens += ev.OutputTokens
+		}
+		ctx := ev.InputTokens + ev.CacheCreationInputTokens + ev.CacheReadInputTokens
+		if ctx > 0 {
+			sess.HasPeakContextTokens = true
+			if ctx > sess.PeakContextTokens {
+				sess.PeakContextTokens = ctx
+			}
+		}
+	}
 
-	return sess, messages, nil
+	return sess, messages, events, nil
+}
+
+// gptmeExactCostEvent builds a ParsedUsageEvent when the assistant message
+// carries a provider-reported billed cost (metadata.cost_source == "provider").
+// The caller must NOT also call applyGptmeTokenUsage for the same message;
+// tokens are placed on the event, leaving the message row token-free.
+func gptmeExactCostEvent(
+	line, sessionID string,
+	ordinal int,
+	model string,
+	ts, sessionStart time.Time,
+) (ParsedUsageEvent, bool) {
+	if gjson.Get(line, "metadata.cost_source").Str != "provider" {
+		return ParsedUsageEvent{}, false
+	}
+	costField := gjson.Get(line, "metadata.cost")
+	if !costField.Exists() || costField.Type != gjson.Number || costField.Num < 0 {
+		return ParsedUsageEvent{}, false
+	}
+	cost, err := money.ParseDollars(costField.Raw)
+	if err != nil {
+		return ParsedUsageEvent{}, false
+	}
+
+	usage := gjson.Get(line, "metadata.usage")
+	input := max(int(usage.Get("input_tokens").Int()), 0)
+	output := max(int(usage.Get("output_tokens").Int()), 0)
+	cacheWrite := max(int(usage.Get("cache_creation_tokens").Int()), 0)
+	cacheRead := max(int(usage.Get("cache_read_tokens").Int()), 0)
+
+	ev := ParsedUsageEvent{
+		SessionID:                sessionID,
+		MessageOrdinal:           &ordinal,
+		Source:                   "llm-response",
+		Model:                    model,
+		InputTokens:              input,
+		OutputTokens:             output,
+		CacheCreationInputTokens: cacheWrite,
+		CacheReadInputTokens:     cacheRead,
+		Cost:                     &cost,
+		CostStatus:               "exact",
+		CostSource:               "gptme-provider-cost",
+		OccurredAt:               timeString(ts.UTC(), sessionStart.UTC()),
+		DedupKey:                 fmt.Sprintf("gptme:%s:message:%d", sessionID, ordinal),
+	}
+	return ev, true
 }
 
 // applyGptmeTokenUsage reads metadata.usage from an assistant message
