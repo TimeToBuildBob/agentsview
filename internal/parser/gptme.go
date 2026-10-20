@@ -109,13 +109,12 @@ func (p *gptmeProvider) parseSession(
 				ContentLength:      len(content),
 				tokenPresenceKnown: true,
 			}
+			applyGptmeTokenUsage(&pm, line)
 			if ev, ok := gptmeExactCostEvent(line, sessionID, ordinal, currentModel, ts, startedAt); ok {
-				// Provider-reported cost: tokens move to the usage event so the
-				// DB does not double-count them from both the message row and
-				// the event row. The message row intentionally carries no tokens.
+				// Keep the display fields and presence flags, but bill tokens only
+				// through the usage event to avoid double-counting in the DB.
+				pm.TokenUsage = nil
 				events = append(events, ev)
-			} else {
-				applyGptmeTokenUsage(&pm, line)
 			}
 			messages = append(messages, pm)
 			ordinal++
@@ -173,30 +172,15 @@ func (p *gptmeProvider) parseSession(
 	}
 
 	accumulateMessageTokenUsage(sess, messages)
-	// Additively merge provider-cost event token totals that were not counted
-	// on the per-message rows (to avoid DB double-counting, those messages carry
-	// no TokenUsage; we recover the totals here so ParsedSession stays accurate).
-	for _, ev := range events {
-		if ev.OutputTokens > 0 {
-			sess.HasTotalOutputTokens = true
-			sess.TotalOutputTokens += ev.OutputTokens
-		}
-		ctx := ev.InputTokens + ev.CacheCreationInputTokens + ev.CacheReadInputTokens
-		if ctx > 0 {
-			sess.HasPeakContextTokens = true
-			if ctx > sess.PeakContextTokens {
-				sess.PeakContextTokens = ctx
-			}
-		}
-	}
 
 	return sess, messages, events, nil
 }
 
 // gptmeExactCostEvent builds a ParsedUsageEvent when the assistant message
 // carries a provider-reported billed cost (metadata.cost_source == "provider").
-// The caller must NOT also call applyGptmeTokenUsage for the same message;
-// tokens are placed on the event, leaving the message row token-free.
+// The caller must clear the message's TokenUsage when this returns an event;
+// display token fields remain on the message, but billing tokens belong only
+// to the event.
 func gptmeExactCostEvent(
 	line, sessionID string,
 	ordinal int,

@@ -215,8 +215,10 @@ func TestGptmeExactCostEvent(t *testing.T) {
 	providerMsg := msgs[1]
 	assert.Equal(t, "openrouter/deepseek/deepseek-v4.1-flash", providerMsg.Model)
 	assert.Nil(t, providerMsg.TokenUsage, "provider-cost message must carry no TokenUsage to avoid DB double-count")
-	assert.False(t, providerMsg.HasOutputTokens)
-	assert.False(t, providerMsg.HasContextTokens)
+	assert.True(t, providerMsg.HasOutputTokens)
+	assert.Equal(t, 20, providerMsg.OutputTokens)
+	assert.True(t, providerMsg.HasContextTokens)
+	assert.Equal(t, 150, providerMsg.ContextTokens)
 
 	// Estimate-only message still carries per-message token data.
 	estimateMsg := msgs[3]
@@ -241,4 +243,6 @@ func TestGptmeExactCostEvent(t *testing.T) {
 	sess := result.Session
 	assert.Equal(t, 20+8, sess.TotalOutputTokens, "provider event + estimate message")
 	assert.True(t, sess.HasTotalOutputTokens)
+	assert.Equal(t, 150, sess.PeakContextTokens)
+	assert.True(t, sess.HasPeakContextTokens)
 }
